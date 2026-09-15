@@ -37,8 +37,7 @@ YEAR_SPONSOR_COLS = (
     "twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url"
 )
 SPONSOR_COLS = (
-    "slug, name, website, logo_path, description, twitter_url, linkedin_url, "
-    "youtube_url, instagram_url, facebook_url"
+    "slug, name, website, logo_path, description, twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url"
 )
 TALK_COLS = "slug, title, description, format, youtube_id, year, speaker_slug, languages, topics"
 
@@ -62,7 +61,9 @@ def reset_counts() -> None:
 
 
 def dsn() -> str:
-    raw = os.environ.get("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev")
+    raw = os.environ.get("DATABASE_URL")
+    if not raw:
+        raise RuntimeError("DATABASE_URL is required for catalog SQL")
     if "sslmode=" not in raw:
         raw += ("&" if "?" in raw else "?") + "sslmode=disable"
     return raw
@@ -85,7 +86,11 @@ def acquire():
                 return _idle.pop()
             if _opened < POOL_SIZE:
                 _opened += 1
-                return open_connection()
+                try:
+                    return open_connection()
+                except Exception:
+                    _opened -= 1
+                    raise
             _pool_lock.wait()
 
 
@@ -116,6 +121,8 @@ def db_query_one(cur, sql: str, args=None):
 
 
 def with_cursor(fn):
+    if QUERY_FN is not None:
+        return fn(None)
     conn = acquire()
     try:
         with conn.cursor() as cur:
@@ -148,17 +155,29 @@ def uniq_tags(talks, key):
     return out
 
 
+def sql_select(cols: str, relation: str, suffix: str = "") -> str:
+    # cols/relation are module constants; WHERE values bind with %s at execute.
+    sql = "SELECT " + cols + " FROM " + relation  # nosec B608
+    if suffix:
+        sql += " " + suffix
+    return sql
+
+
 def talks_for(cur, slug, year=None):
     if year is None:
         rows = db_query(
             cur,
-            f"SELECT {TALK_COLS} FROM v1_talks WHERE speaker_slug = %s ORDER BY year DESC",
+            sql_select(TALK_COLS, "v1_talks", "WHERE speaker_slug = %s ORDER BY year DESC"),
             (slug,),
         )
     else:
         rows = db_query(
             cur,
-            f"SELECT {TALK_COLS} FROM v1_talks WHERE speaker_slug = %s AND year = %s ORDER BY year DESC",
+            sql_select(
+                TALK_COLS,
+                "v1_talks",
+                "WHERE speaker_slug = %s AND year = %s ORDER BY year DESC",
+            ),
             (slug, year),
         )
     return [clean(r) for r in rows]
@@ -183,13 +202,13 @@ def sponsor_years(cur, slug):
 
 
 def load_speaker(cur, slug):
-    return clean(db_query_one(cur, f"SELECT {SPEAKER_COLS} FROM v1_speakers WHERE slug = %s", (slug,)))
+    return clean(db_query_one(cur, sql_select(SPEAKER_COLS, "v1_speakers", "WHERE slug = %s"), (slug,)))
 
 
 def load_talks_for_year(cur, year):
     rows = db_query(
         cur,
-        f"SELECT {TALK_COLS} FROM v1_talks WHERE year = %s ORDER BY speaker_slug, year DESC",
+        sql_select(TALK_COLS, "v1_talks", "WHERE year = %s ORDER BY speaker_slug, year DESC"),
         (year,),
     )
     out = {}
@@ -239,13 +258,18 @@ def attach_year_tags(cur, speakers, year):
 
 def list_speakers(cur, year=None):
     if year is None:
-        rows = db_query(cur, f"SELECT {SPEAKER_COLS} FROM v1_speakers ORDER BY last_name, first_name")
+        rows = db_query(
+            cur,
+            sql_select(SPEAKER_COLS, "v1_speakers", "ORDER BY last_name, first_name"),
+        )
         return [clean(r) for r in rows]
     rows = db_query(
         cur,
-        f"SELECT {SPEAKER_COLS} FROM v1_speakers "
-        "WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = %s) "
-        "ORDER BY last_name, first_name",
+        sql_select(
+            SPEAKER_COLS,
+            "v1_speakers",
+            "WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = %s) ORDER BY last_name, first_name",
+        ),
         (year,),
     )
     return attach_year_tags(cur, [clean(r) for r in rows], year)

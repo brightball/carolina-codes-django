@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import urllib.request
+from urllib.parse import urlparse
 
 from catalog import db
 
@@ -12,6 +13,10 @@ def register_with_elixir(port: str | None = None) -> None:
     url = os.environ.get("CAROLINA_URL")
     token = os.environ.get("POLYGLOT_REGISTER_TOKEN")
     if not url or not token:
+        return
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        print(f"register: refused scheme {parsed.scheme!r}", file=sys.stderr)
         return
     port = port or os.environ.get("PORT", "4019")
     base = os.environ.get("PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
@@ -28,7 +33,7 @@ def register_with_elixir(port: str | None = None) -> None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310
             print(f"registered with elixir: {resp.status}", file=sys.stderr)
     except Exception as exc:
         print(f"register: {exc}", file=sys.stderr)

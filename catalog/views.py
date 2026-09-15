@@ -86,11 +86,18 @@ def sponsors(request):
         if raw:
             rows = db.db_query(
                 cur,
-                f"SELECT {db.YEAR_SPONSOR_COLS} FROM v1_year_sponsors WHERE year = %s ORDER BY name",
+                db.sql_select(
+                    db.YEAR_SPONSOR_COLS,
+                    "v1_year_sponsors",
+                    "WHERE year = %s ORDER BY name",
+                ),
                 (int(raw),),
             )
         else:
-            rows = db.db_query(cur, f"SELECT {db.SPONSOR_COLS} FROM v1_sponsors ORDER BY name")
+            rows = db.db_query(
+                cur,
+                db.sql_select(db.SPONSOR_COLS, "v1_sponsors", "ORDER BY name"),
+            )
         return [db.clean(r) for r in rows]
 
     return _json({"data": db.with_cursor(run)})
@@ -98,7 +105,13 @@ def sponsors(request):
 
 def sponsor_detail(request, slug):
     def run(cur):
-        row = db.clean(db.db_query_one(cur, f"SELECT {db.SPONSOR_COLS} FROM v1_sponsors WHERE slug = %s", (slug,)))
+        row = db.clean(
+            db.db_query_one(
+                cur,
+                db.sql_select(db.SPONSOR_COLS, "v1_sponsors", "WHERE slug = %s"),
+                (slug,),
+            )
+        )
         if not row:
             return None
         rows = db.db_query(cur, "SELECT * FROM v1_sponsorships WHERE sponsor_slug = %s", (slug,))
@@ -116,7 +129,11 @@ def sponsor_year(request, year, slug):
         row = db.clean(
             db.db_query_one(
                 cur,
-                f"SELECT {db.YEAR_SPONSOR_COLS} FROM v1_year_sponsors WHERE year = %s AND slug = %s",
+                db.sql_select(
+                    db.YEAR_SPONSOR_COLS,
+                    "v1_year_sponsors",
+                    "WHERE year = %s AND slug = %s",
+                ),
                 (year, slug),
             )
         )

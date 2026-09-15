@@ -1,14 +1,17 @@
-import json
 import os
+import re
 import subprocess
 import sys
 import threading
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from django.conf import settings
-from django.test import SimpleTestCase, Client
+from django.test import Client, SimpleTestCase
 
 from catalog import db
+from catalog.register import register_with_elixir
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -16,6 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 class PolyglotApiTests(SimpleTestCase):
     def setUp(self):
         db.reset_counts()
+        db.QUERY_FN = None
+        db.CONNECT_FN = None
         self.client = Client()
 
     def test_is_django_not_http_server(self):
@@ -61,6 +66,12 @@ class PolyglotApiTests(SimpleTestCase):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertIn("must not alter the shared Postgres catalog", proc.stderr)
+
+    def test_register_refuses_non_http_scheme(self):
+        env = {"CAROLINA_URL": "file:///etc/passwd", "POLYGLOT_REGISTER_TOKEN": "dev"}
+        with patch.dict(os.environ, env), patch("sys.stderr", new=StringIO()) as err:
+            register_with_elixir()
+        self.assertIn("refused scheme", err.getvalue())
 
     def test_health_without_sql_or_postgres(self):
         response = self.client.get("/health")
@@ -147,6 +158,7 @@ class PolyglotApiTests(SimpleTestCase):
         try:
             db.with_cursor(lambda cur: db.db_query(cur, "SELECT 1 AS ok"))
         except Exception:
+
             def fake(sql, args):
                 if "FROM v1_speakers WHERE slug =" in sql:
                     return []
@@ -185,3 +197,89 @@ class PolyglotApiTests(SimpleTestCase):
 
             db.QUERY_FN = fake
             db.CONNECT_FN = lambda: (_ for _ in ()).throw(RuntimeError("fake connect"))
+
+
+CHECK_IDS = ("tests", "sast", "audit", "gitleaks", "style")
+CHECK_COMMANDS = {
+    "tests": "uv run python manage.py test",
+    "sast": "uv run bandit -r catalog config manage.py -x catalog/tests.py",
+    "audit": "uv run pip-audit",
+    "gitleaks": "gitleaks detect --source . --verbose --no-banner",
+    "style": "uv run ruff check .",
+}
+CLONE_CMD = 'git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .'
+
+
+def _workflow_jobs(yaml: str):
+    parts = re.split(r"^jobs:\s*$", yaml, maxsplit=1, flags=re.M)
+    rest = parts[1] if len(parts) == 2 else ""
+    return [
+        (m.group(1), m.group(2))
+        for m in re.finditer(
+            r"^  ([A-Za-z0-9_-]+):\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:|\Z)",
+            rest,
+            re.M,
+        )
+    ]
+
+
+def _precommit_hook_ids(src: str):
+    return re.findall(r"^\s+- id: ([A-Za-z0-9_-]+)\s*$", src, re.M)
+
+
+class QualityGatesTests(SimpleTestCase):
+    def test_precommit_declares_five_distinct_checks(self):
+        src = (ROOT / ".pre-commit-config.yaml").read_text()
+        hook_ids = _precommit_hook_ids(src)
+        self.assertEqual(tuple(hook_ids), CHECK_IDS)
+        for hook_id, command in CHECK_COMMANDS.items():
+            self.assertIn(f"id: {hook_id}", src)
+            self.assertIn(command, src)
+        self.assertIn("pass_filenames: false", src)
+        self.assertIn("always_run: true", src)
+        self.assertNotIn("pre-commit run --all-files", src)
+
+    def test_gitea_workflow_is_actions_with_five_parallel_check_jobs(self):
+        workflow_path = ROOT / ".gitea" / "workflows" / "precommit.yml"
+        self.assertTrue(workflow_path.is_file())
+        workflow = workflow_path.read_text()
+        self.assertIsNotNone(
+            re.search(r"^on:\n  push:\n  pull_request:\n", workflow, re.M),
+            "workflow must trigger on push and pull_request",
+        )
+        self.assertIn("jobs:", workflow)
+        jobs = _workflow_jobs(workflow)
+        job_names = [name for name, _ in jobs]
+        self.assertEqual(job_names, list(CHECK_IDS))
+        self.assertNotIn("pre-commit run", workflow)
+        self.assertNotIn("uses: actions/checkout", workflow)
+
+        for name, body in jobs:
+            self.assertNotIn("needs:", body, f"{name} must not depend on other jobs")
+            self.assertNotIn("git init", body, f"{name} must not git init")
+            self.assertIn(CLONE_CMD, body)
+            self.assertIn('git fetch --depth 1 origin "${GITHUB_SHA}"', body)
+            self.assertIn("missing job token for git fetch", body)
+            self.assertIn(CHECK_COMMANDS[name], body)
+            for other, command in CHECK_COMMANDS.items():
+                if other == name:
+                    continue
+                self.assertNotIn(
+                    command,
+                    body,
+                    f"{name} must not run {other} ({command})",
+                )
+
+    def test_readme_documents_hooks_and_five_local_checks(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("uv run pre-commit install", readme)
+        self.assertIn("SKIP=tests,sast,audit,gitleaks,style git commit", readme)
+        for command in CHECK_COMMANDS.values():
+            self.assertIn(command, readme)
+        pyproject = (ROOT / "pyproject.toml").read_text()
+        self.assertIn("bandit", pyproject)
+        self.assertIn("pip-audit", pyproject)
+        self.assertIn("ruff", pyproject)
+        self.assertIn("pre-commit", pyproject)
+        mise = (ROOT / "mise.toml").read_text()
+        self.assertIn("gitleaks", mise)

@@ -16,6 +16,25 @@ uv run gunicorn --bind "[::]:4019" config.wsgi:application
 
 `GET /` reports `language: "Python"` and `framework: "Django"`. `GET /health` returns `{"status":"ok"}` without touching Postgres.
 
+## Quality checks
+
+Install git hooks once (`gitleaks` must be on PATH; `mise.toml` pins it):
+
+```bash
+uv sync
+uv run pre-commit install
+```
+
+`git commit` then runs all five checks. Emergency skip: `SKIP=tests,sast,audit,gitleaks,style git commit`.
+
+The same five checks, also run as parallel Gitea Actions jobs:
+
 ```bash
 uv run python manage.py test
+uv run bandit -r catalog config manage.py -x catalog/tests.py
+uv run pip-audit
+gitleaks detect --source . --verbose --no-banner
+uv run ruff check .
 ```
+
+Or together: `uv run pre-commit run --all-files`.

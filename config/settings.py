@@ -1,11 +1,12 @@
 """Django settings. Catalog Postgres is never Django's DATABASES default."""
 
 import os
+import secrets
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "carolina-codes-django-dev")
+SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_urlsafe(50)
 DEBUG = os.environ.get("DJANGO_DEBUG", "0") == "1"
 ALLOWED_HOSTS = ["*"]
 

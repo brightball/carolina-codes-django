@@ -7,3 +7,28 @@ dependencies = [
     "gunicorn>=23.0",
     "psycopg[binary]>=3.2",
 ]
+
+[dependency-groups]
+dev = [
+    "bandit>=1.8",
+    "pip-audit>=2.9",
+    "pre-commit>=4.0",
+    "ruff>=0.11",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["catalog", "config"]
+exclude = [".venv", ".git"]
+
+[tool.ruff.lint]
+# Style only. Security stays on Bandit (do not select ruff's S rules).
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["catalog", "config"]
+known-third-party = ["django"]
+
+[tool.bandit]
+exclude_dirs = [".venv", ".git"]
