@@ -1,11 +1,18 @@
+import gzip
+import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
+import tempfile
+import textwrap
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 from django.conf import settings
 from django.test import Client, SimpleTestCase
@@ -208,6 +215,16 @@ CHECK_COMMANDS = {
     "style": "uv run ruff check .",
 }
 CLONE_CMD = 'git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .'
+PREP_JOB = "prep"
+UV_INSTALLER = "https://astral.sh/uv/install.sh"
+GITLEAKS_TARBALL = "gitleaks_8.30.1_linux_x64.tar.gz"
+SETUP_SNIPPETS = (
+    "apt-get",
+    "uv sync",
+    UV_INSTALLER,
+    GITLEAKS_TARBALL,
+    CLONE_CMD,
+)
 
 
 def _workflow_jobs(yaml: str):
@@ -225,6 +242,90 @@ def _workflow_jobs(yaml: str):
 
 def _precommit_hook_ids(src: str):
     return re.findall(r"^\s+- id: ([A-Za-z0-9_-]+)\s*$", src, re.M)
+
+
+def _check_restore_script(job_body: str) -> str:
+    match = re.search(
+        r"^      - run: \|\n([\s\S]*?)(?=^      - run: |\Z)",
+        job_body,
+        re.M,
+    )
+    if match is None:
+        raise AssertionError("check job is missing a restore run: | step")
+    return textwrap.dedent(match.group(1))
+
+
+def _gitea_artifact_handler(blob: bytes, token: str, run_id: str):
+    compressed = gzip.compress(blob)
+    list_path = f"/api/actions_pipeline/_apis/pipelines/workflows/{run_id}/artifacts"
+    files_suffix = "/download_url"
+    download_path = f"/api/actions_pipeline/_apis/pipelines/workflows/{run_id}/artifacts/99/download"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def _unauthorized(self):
+            self.send_response(401)
+            self.end_headers()
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {token}":
+                self._unauthorized()
+                return
+            if parsed.path == list_path:
+                payload = {
+                    "count": 1,
+                    "value": [
+                        {
+                            "name": "prep-workspace",
+                            "fileContainerResourceUrl": f"http://{self.headers.get('Host')}{list_path}/hash{files_suffix}",
+                        }
+                    ],
+                }
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            if parsed.path.endswith(files_suffix):
+                query = parse_qs(parsed.query)
+                if query.get("itemPath", [""])[0] != "prep-workspace":
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                payload = {
+                    "value": [
+                        {
+                            "path": "prep-workspace/prep-workspace.tar.gz",
+                            "itemType": "file",
+                            "contentLocation": f"http://{self.headers.get('Host')}{download_path}",
+                        }
+                    ]
+                }
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            if parsed.path == download_path:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(compressed)))
+                self.end_headers()
+                self.wfile.write(compressed)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    return Handler
 
 
 class QualityGatesTests(SimpleTestCase):
@@ -250,17 +351,44 @@ class QualityGatesTests(SimpleTestCase):
         self.assertIn("jobs:", workflow)
         jobs = _workflow_jobs(workflow)
         job_names = [name for name, _ in jobs]
-        self.assertEqual(job_names, list(CHECK_IDS))
+        self.assertEqual(job_names, [PREP_JOB, *CHECK_IDS])
         self.assertNotIn("pre-commit run", workflow)
         self.assertNotIn("uses: actions/checkout", workflow)
+        self.assertNotIn("actions/upload-artifact@v4", workflow)
 
-        for name, body in jobs:
-            self.assertNotIn("needs:", body, f"{name} must not depend on other jobs")
-            self.assertNotIn("git init", body, f"{name} must not git init")
-            self.assertIn(CLONE_CMD, body)
-            self.assertIn('git fetch --depth 1 origin "${GITHUB_SHA}"', body)
-            self.assertIn("missing job token for git fetch", body)
+        by_name = dict(jobs)
+        prep = by_name[PREP_JOB]
+        self.assertNotIn("needs:", prep, "prep must not depend on a check job")
+        self.assertIsNone(re.search(r"^\s*git init\b", prep, re.M), "prep must not git init")
+        self.assertIn(CLONE_CMD, prep)
+        self.assertIn('git fetch --depth 1 origin "${GITHUB_SHA}"', prep)
+        self.assertIn("missing job token for git fetch", prep)
+        self.assertIn("apt-get", prep)
+        self.assertIn(UV_INSTALLER, prep)
+        self.assertIn("uv sync --frozen --all-groups", prep)
+        self.assertIn(GITLEAKS_TARBALL, prep)
+        self.assertIn("tar -czf /tmp/prep-workspace.tar.gz", prep)
+        self.assertIn("actions/upload-artifact@v3", prep)
+        self.assertIn("name: prep-workspace", prep)
+        for command in CHECK_COMMANDS.values():
+            self.assertNotIn(command, prep, f"prep must not run {command}")
+
+        for name in CHECK_IDS:
+            body = by_name[name]
+            self.assertIn("needs: prep", body, f"{name} must wait on prep")
+            needs = re.findall(r"^\s+needs:\s*(.+)\s*$", body, re.M)
+            self.assertEqual(needs, ["prep"], f"{name} must needs: only prep, got {needs}")
             self.assertIn(CHECK_COMMANDS[name], body)
+            self.assertIn("ACTIONS_RUNTIME_URL", body)
+            self.assertIn("ACTIONS_RUNTIME_TOKEN", body)
+            self.assertIn("prep-workspace.tar.gz", body)
+            self.assertIn("tar -xzf", body)
+            self.assertIsNone(
+                re.search(r"^\s*git init\b", body, re.M),
+                f"{name} must not git init",
+            )
+            for snippet in SETUP_SNIPPETS:
+                self.assertNotIn(snippet, body, f"{name} must not repeat {snippet!r}")
             for other, command in CHECK_COMMANDS.items():
                 if other == name:
                     continue
@@ -269,6 +397,72 @@ class QualityGatesTests(SimpleTestCase):
                     body,
                     f"{name} must not run {other} ({command})",
                 )
+
+        clone_jobs = [name for name, body in jobs if CLONE_CMD in body]
+        self.assertEqual(clone_jobs, [PREP_JOB], "only prep clones GITHUB_SHA")
+
+    def test_gitea_check_jobs_restore_prep_workspace_artifact(self):
+        workflow = (ROOT / ".gitea" / "workflows" / "precommit.yml").read_text()
+        jobs = dict(_workflow_jobs(workflow))
+        restore = _check_restore_script(jobs["tests"])
+        self.assertIn("ACTIONS_RUNTIME_URL", restore)
+        self.assertIn("prep-workspace.tar.gz", restore)
+        for name in CHECK_IDS:
+            self.assertEqual(
+                _check_restore_script(jobs[name]),
+                restore,
+                f"{name} must restore the same prep artifact as tests",
+            )
+
+        marker = "restored-from-prep\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "payload"
+            payload.mkdir()
+            (payload / "RESTORE_OK").write_text(marker)
+            ci_bin = payload / ".ci" / "bin"
+            ci_bin.mkdir(parents=True)
+            (ci_bin / "uv").write_text("#!/bin/sh\necho uv-from-prep\n")
+            (ci_bin / "gitleaks").write_text("#!/bin/sh\necho gitleaks-from-prep\n")
+            tar_path = Path(tmp) / "prep-workspace.tar.gz"
+            with tarfile.open(tar_path, "w:gz") as tf:
+                tf.add(payload / "RESTORE_OK", arcname="RESTORE_OK")
+                tf.add(ci_bin / "uv", arcname=".ci/bin/uv")
+                tf.add(ci_bin / "gitleaks", arcname=".ci/bin/gitleaks")
+            blob = tar_path.read_bytes()
+
+            handler = _gitea_artifact_handler(blob, token="test-token", run_id="42")
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            work = Path(tmp) / "work"
+            work.mkdir()
+            gh_path = Path(tmp) / "github_path"
+            env = os.environ.copy()
+            env["ACTIONS_RUNTIME_URL"] = f"http://127.0.0.1:{httpd.server_address[1]}/api/actions_pipeline/"
+            env["ACTIONS_RUNTIME_TOKEN"] = "test-token"
+            env["GITHUB_RUN_ID"] = "42"
+            env["GITHUB_PATH"] = str(gh_path)
+            try:
+                completed = subprocess.run(
+                    ["bash", "-lc", restore],
+                    cwd=work,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"restore failed: stdout={completed.stdout!r} stderr={completed.stderr!r}",
+                )
+                self.assertEqual((work / "RESTORE_OK").read_text(), marker)
+                self.assertTrue((work / ".ci" / "bin" / "uv").is_file())
+                self.assertIn(".ci/bin", gh_path.read_text())
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=5)
 
     def test_readme_documents_hooks_and_five_local_checks(self):
         readme = (ROOT / "README.md").read_text()

@@ -1,11 +1,17 @@
 # One Gitea Actions job per quality check. Not a combined pre-commit job.
 #
 # act_runner starts a new container per job and blocks host bind-mounts
-# (valid_volumes is empty). actions/checkout cannot run in these images.
-# Clone GITHUB_SHA with the job token over HTTPS. Gitea git HTTP returns
-# 401 without the token. Do not git init or set init.defaultBranch here.
+# (valid_volumes is empty). A shared environment must be transferred.
+# Prep clones GITHUB_SHA with the job token over HTTPS, installs git/uv/
+# gitleaks, runs uv sync --frozen --all-groups, and uploads a workspace
+# tarball. The five check jobs restore that artifact and run one command.
+# They do not clone, apt-get, install uv/gitleaks, or uv sync.
 #
-# The five check jobs do not needs: each other; they clone and run in parallel.
+# python:3.12-bookworm has no Node, so check jobs cannot run
+# actions/download-artifact. They download the v3 artifact through the
+# Gitea actions pipeline API with Python stdlib instead. Prep still uses
+# actions/upload-artifact@v3 (nodejs is installed only in prep).
+# Do not git init, set init.defaultBranch, or use actions/checkout.
 name: precommit
 
 on:
@@ -20,14 +26,14 @@ env:
   GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
-  tests:
+  prep:
     runs-on: ubuntu-latest
     container:
       image: docker.io/library/python:3.12-bookworm
       env:
         GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl nodejs
       - run: |
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
@@ -37,86 +43,492 @@ jobs:
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
       - run: curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="/usr/local/bin" sh
-      - run: uv sync --frozen --all-groups
-      - run: uv run python manage.py test
-
-  sast:
-    runs-on: ubuntu-latest
-    container:
-      image: docker.io/library/python:3.12-bookworm
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl
-      - run: |
-          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
-      - run: curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="/usr/local/bin" sh
-      - run: uv sync --frozen --all-groups
-      - run: uv run bandit -r catalog config manage.py -x catalog/tests.py
-
-  audit:
-    runs-on: ubuntu-latest
-    container:
-      image: docker.io/library/python:3.12-bookworm
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl
-      - run: |
-          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
-      - run: curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="/usr/local/bin" sh
-      - run: uv sync --frozen --all-groups
-      - run: uv run pip-audit
-
-  gitleaks:
-    runs-on: ubuntu-latest
-    container:
-      image: docker.io/library/python:3.12-bookworm
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl
-      - run: |
-          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
       - run: |
           curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
             | tar -xz -C /usr/local/bin gitleaks
-      - run: gitleaks detect --source . --verbose --no-banner
+      - run: UV_VENV_RELOCATABLE=1 uv sync --frozen --all-groups
+      - run: |
+          mkdir -p .ci/bin
+          cp "$(command -v uv)" .ci/bin/uv
+          cp "$(command -v gitleaks)" .ci/bin/gitleaks
+          chmod -R a+x .ci/bin
+          tar -czf /tmp/prep-workspace.tar.gz \
+            --exclude=./.git \
+            .
+          mv /tmp/prep-workspace.tar.gz prep-workspace.tar.gz
+      - uses: actions/upload-artifact@v3
+        with:
+          name: prep-workspace
+          path: prep-workspace.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
-  style:
+  tests:
+    needs: prep
     runs-on: ubuntu-latest
     container:
       image: docker.io/library/python:3.12-bookworm
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl
       - run: |
-          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
-      - run: curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="/usr/local/bin" sh
-      - run: uv sync --frozen --all-groups
+          python3 - <<'PY'
+          import gzip, json, os, sys, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+
+          NAME = "prep-workspace"
+          RUNTIME = os.environ["ACTIONS_RUNTIME_URL"]
+          TOKEN = os.environ["ACTIONS_RUNTIME_TOKEN"]
+          RUN_ID = os.environ["GITHUB_RUN_ID"]
+          API = "6.0-preview"
+
+
+          def absurl(url: str) -> str:
+              if url.startswith("http://") or url.startswith("https://"):
+                  return url
+              parsed = urllib.parse.urlparse(RUNTIME)
+              origin = f"{parsed.scheme}://{parsed.netloc}"
+              if url.startswith("/"):
+                  return origin + url
+              return RUNTIME.rstrip("/") + "/" + url
+
+
+          def api_get(url: str):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": f"application/json;api-version={API}",
+                  },
+              )
+              return urllib.request.urlopen(req)
+
+
+          list_url = f"{RUNTIME}_apis/pipelines/workflows/{RUN_ID}/artifacts?api-version={API}"
+          listing = None
+          last_err = None
+          for _ in range(12):
+              try:
+                  with api_get(list_url) as resp:
+                      listing = json.load(resp)
+                  break
+              except urllib.error.HTTPError as err:
+                  last_err = err
+                  if err.code not in (404, 500):
+                      raise
+                  import time
+
+                  time.sleep(2)
+          if listing is None:
+              raise SystemExit(f"artifact list failed: {last_err}")
+          arts = [a for a in listing.get("value") or [] if a.get("name") == NAME]
+          if not arts:
+              raise SystemExit(f"artifact {NAME} not found: {listing}")
+          container = absurl(arts[0]["fileContainerResourceUrl"])
+          sep = "&" if "?" in container else "?"
+          files_url = f"{container}{sep}itemPath={urllib.parse.quote(NAME)}"
+          with api_get(files_url) as resp:
+              files = json.load(resp)
+          downloaded = False
+          for item in files.get("value") or []:
+              if item.get("itemType") not in (None, "file"):
+                  continue
+              loc = absurl(item["contentLocation"])
+              req = urllib.request.Request(loc, headers={"Authorization": f"Bearer {TOKEN}"})
+              with urllib.request.urlopen(req) as resp:
+                  data = resp.read()
+                  encoding = (resp.headers.get("Content-Encoding") or "").lower()
+              if encoding == "gzip":
+                  data = gzip.decompress(data)
+              Path("prep-workspace.tar.gz").write_bytes(data)
+              downloaded = True
+              break
+          if not downloaded:
+              raise SystemExit(f"no artifact files: {files}")
+          PY
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          if [ -d .ci/bin ]; then
+            if [ -w /usr/local/bin ]; then
+              cp -a .ci/bin/. /usr/local/bin/
+            fi
+            if [ -n "${GITHUB_PATH:-}" ]; then
+              echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+      - run: uv run python manage.py test
+
+  sast:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/python:3.12-bookworm
+    steps:
+      - run: |
+          python3 - <<'PY'
+          import gzip, json, os, sys, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+
+          NAME = "prep-workspace"
+          RUNTIME = os.environ["ACTIONS_RUNTIME_URL"]
+          TOKEN = os.environ["ACTIONS_RUNTIME_TOKEN"]
+          RUN_ID = os.environ["GITHUB_RUN_ID"]
+          API = "6.0-preview"
+
+
+          def absurl(url: str) -> str:
+              if url.startswith("http://") or url.startswith("https://"):
+                  return url
+              parsed = urllib.parse.urlparse(RUNTIME)
+              origin = f"{parsed.scheme}://{parsed.netloc}"
+              if url.startswith("/"):
+                  return origin + url
+              return RUNTIME.rstrip("/") + "/" + url
+
+
+          def api_get(url: str):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": f"application/json;api-version={API}",
+                  },
+              )
+              return urllib.request.urlopen(req)
+
+
+          list_url = f"{RUNTIME}_apis/pipelines/workflows/{RUN_ID}/artifacts?api-version={API}"
+          listing = None
+          last_err = None
+          for _ in range(12):
+              try:
+                  with api_get(list_url) as resp:
+                      listing = json.load(resp)
+                  break
+              except urllib.error.HTTPError as err:
+                  last_err = err
+                  if err.code not in (404, 500):
+                      raise
+                  import time
+
+                  time.sleep(2)
+          if listing is None:
+              raise SystemExit(f"artifact list failed: {last_err}")
+          arts = [a for a in listing.get("value") or [] if a.get("name") == NAME]
+          if not arts:
+              raise SystemExit(f"artifact {NAME} not found: {listing}")
+          container = absurl(arts[0]["fileContainerResourceUrl"])
+          sep = "&" if "?" in container else "?"
+          files_url = f"{container}{sep}itemPath={urllib.parse.quote(NAME)}"
+          with api_get(files_url) as resp:
+              files = json.load(resp)
+          downloaded = False
+          for item in files.get("value") or []:
+              if item.get("itemType") not in (None, "file"):
+                  continue
+              loc = absurl(item["contentLocation"])
+              req = urllib.request.Request(loc, headers={"Authorization": f"Bearer {TOKEN}"})
+              with urllib.request.urlopen(req) as resp:
+                  data = resp.read()
+                  encoding = (resp.headers.get("Content-Encoding") or "").lower()
+              if encoding == "gzip":
+                  data = gzip.decompress(data)
+              Path("prep-workspace.tar.gz").write_bytes(data)
+              downloaded = True
+              break
+          if not downloaded:
+              raise SystemExit(f"no artifact files: {files}")
+          PY
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          if [ -d .ci/bin ]; then
+            if [ -w /usr/local/bin ]; then
+              cp -a .ci/bin/. /usr/local/bin/
+            fi
+            if [ -n "${GITHUB_PATH:-}" ]; then
+              echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+      - run: uv run bandit -r catalog config manage.py -x catalog/tests.py
+
+  audit:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/python:3.12-bookworm
+    steps:
+      - run: |
+          python3 - <<'PY'
+          import gzip, json, os, sys, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+
+          NAME = "prep-workspace"
+          RUNTIME = os.environ["ACTIONS_RUNTIME_URL"]
+          TOKEN = os.environ["ACTIONS_RUNTIME_TOKEN"]
+          RUN_ID = os.environ["GITHUB_RUN_ID"]
+          API = "6.0-preview"
+
+
+          def absurl(url: str) -> str:
+              if url.startswith("http://") or url.startswith("https://"):
+                  return url
+              parsed = urllib.parse.urlparse(RUNTIME)
+              origin = f"{parsed.scheme}://{parsed.netloc}"
+              if url.startswith("/"):
+                  return origin + url
+              return RUNTIME.rstrip("/") + "/" + url
+
+
+          def api_get(url: str):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": f"application/json;api-version={API}",
+                  },
+              )
+              return urllib.request.urlopen(req)
+
+
+          list_url = f"{RUNTIME}_apis/pipelines/workflows/{RUN_ID}/artifacts?api-version={API}"
+          listing = None
+          last_err = None
+          for _ in range(12):
+              try:
+                  with api_get(list_url) as resp:
+                      listing = json.load(resp)
+                  break
+              except urllib.error.HTTPError as err:
+                  last_err = err
+                  if err.code not in (404, 500):
+                      raise
+                  import time
+
+                  time.sleep(2)
+          if listing is None:
+              raise SystemExit(f"artifact list failed: {last_err}")
+          arts = [a for a in listing.get("value") or [] if a.get("name") == NAME]
+          if not arts:
+              raise SystemExit(f"artifact {NAME} not found: {listing}")
+          container = absurl(arts[0]["fileContainerResourceUrl"])
+          sep = "&" if "?" in container else "?"
+          files_url = f"{container}{sep}itemPath={urllib.parse.quote(NAME)}"
+          with api_get(files_url) as resp:
+              files = json.load(resp)
+          downloaded = False
+          for item in files.get("value") or []:
+              if item.get("itemType") not in (None, "file"):
+                  continue
+              loc = absurl(item["contentLocation"])
+              req = urllib.request.Request(loc, headers={"Authorization": f"Bearer {TOKEN}"})
+              with urllib.request.urlopen(req) as resp:
+                  data = resp.read()
+                  encoding = (resp.headers.get("Content-Encoding") or "").lower()
+              if encoding == "gzip":
+                  data = gzip.decompress(data)
+              Path("prep-workspace.tar.gz").write_bytes(data)
+              downloaded = True
+              break
+          if not downloaded:
+              raise SystemExit(f"no artifact files: {files}")
+          PY
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          if [ -d .ci/bin ]; then
+            if [ -w /usr/local/bin ]; then
+              cp -a .ci/bin/. /usr/local/bin/
+            fi
+            if [ -n "${GITHUB_PATH:-}" ]; then
+              echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+      - run: uv run pip-audit
+
+  gitleaks:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/python:3.12-bookworm
+    steps:
+      - run: |
+          python3 - <<'PY'
+          import gzip, json, os, sys, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+
+          NAME = "prep-workspace"
+          RUNTIME = os.environ["ACTIONS_RUNTIME_URL"]
+          TOKEN = os.environ["ACTIONS_RUNTIME_TOKEN"]
+          RUN_ID = os.environ["GITHUB_RUN_ID"]
+          API = "6.0-preview"
+
+
+          def absurl(url: str) -> str:
+              if url.startswith("http://") or url.startswith("https://"):
+                  return url
+              parsed = urllib.parse.urlparse(RUNTIME)
+              origin = f"{parsed.scheme}://{parsed.netloc}"
+              if url.startswith("/"):
+                  return origin + url
+              return RUNTIME.rstrip("/") + "/" + url
+
+
+          def api_get(url: str):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": f"application/json;api-version={API}",
+                  },
+              )
+              return urllib.request.urlopen(req)
+
+
+          list_url = f"{RUNTIME}_apis/pipelines/workflows/{RUN_ID}/artifacts?api-version={API}"
+          listing = None
+          last_err = None
+          for _ in range(12):
+              try:
+                  with api_get(list_url) as resp:
+                      listing = json.load(resp)
+                  break
+              except urllib.error.HTTPError as err:
+                  last_err = err
+                  if err.code not in (404, 500):
+                      raise
+                  import time
+
+                  time.sleep(2)
+          if listing is None:
+              raise SystemExit(f"artifact list failed: {last_err}")
+          arts = [a for a in listing.get("value") or [] if a.get("name") == NAME]
+          if not arts:
+              raise SystemExit(f"artifact {NAME} not found: {listing}")
+          container = absurl(arts[0]["fileContainerResourceUrl"])
+          sep = "&" if "?" in container else "?"
+          files_url = f"{container}{sep}itemPath={urllib.parse.quote(NAME)}"
+          with api_get(files_url) as resp:
+              files = json.load(resp)
+          downloaded = False
+          for item in files.get("value") or []:
+              if item.get("itemType") not in (None, "file"):
+                  continue
+              loc = absurl(item["contentLocation"])
+              req = urllib.request.Request(loc, headers={"Authorization": f"Bearer {TOKEN}"})
+              with urllib.request.urlopen(req) as resp:
+                  data = resp.read()
+                  encoding = (resp.headers.get("Content-Encoding") or "").lower()
+              if encoding == "gzip":
+                  data = gzip.decompress(data)
+              Path("prep-workspace.tar.gz").write_bytes(data)
+              downloaded = True
+              break
+          if not downloaded:
+              raise SystemExit(f"no artifact files: {files}")
+          PY
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          if [ -d .ci/bin ]; then
+            if [ -w /usr/local/bin ]; then
+              cp -a .ci/bin/. /usr/local/bin/
+            fi
+            if [ -n "${GITHUB_PATH:-}" ]; then
+              echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+      - run: gitleaks detect --source . --verbose --no-banner
+
+  style:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/python:3.12-bookworm
+    steps:
+      - run: |
+          python3 - <<'PY'
+          import gzip, json, os, sys, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+
+          NAME = "prep-workspace"
+          RUNTIME = os.environ["ACTIONS_RUNTIME_URL"]
+          TOKEN = os.environ["ACTIONS_RUNTIME_TOKEN"]
+          RUN_ID = os.environ["GITHUB_RUN_ID"]
+          API = "6.0-preview"
+
+
+          def absurl(url: str) -> str:
+              if url.startswith("http://") or url.startswith("https://"):
+                  return url
+              parsed = urllib.parse.urlparse(RUNTIME)
+              origin = f"{parsed.scheme}://{parsed.netloc}"
+              if url.startswith("/"):
+                  return origin + url
+              return RUNTIME.rstrip("/") + "/" + url
+
+
+          def api_get(url: str):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": f"application/json;api-version={API}",
+                  },
+              )
+              return urllib.request.urlopen(req)
+
+
+          list_url = f"{RUNTIME}_apis/pipelines/workflows/{RUN_ID}/artifacts?api-version={API}"
+          listing = None
+          last_err = None
+          for _ in range(12):
+              try:
+                  with api_get(list_url) as resp:
+                      listing = json.load(resp)
+                  break
+              except urllib.error.HTTPError as err:
+                  last_err = err
+                  if err.code not in (404, 500):
+                      raise
+                  import time
+
+                  time.sleep(2)
+          if listing is None:
+              raise SystemExit(f"artifact list failed: {last_err}")
+          arts = [a for a in listing.get("value") or [] if a.get("name") == NAME]
+          if not arts:
+              raise SystemExit(f"artifact {NAME} not found: {listing}")
+          container = absurl(arts[0]["fileContainerResourceUrl"])
+          sep = "&" if "?" in container else "?"
+          files_url = f"{container}{sep}itemPath={urllib.parse.quote(NAME)}"
+          with api_get(files_url) as resp:
+              files = json.load(resp)
+          downloaded = False
+          for item in files.get("value") or []:
+              if item.get("itemType") not in (None, "file"):
+                  continue
+              loc = absurl(item["contentLocation"])
+              req = urllib.request.Request(loc, headers={"Authorization": f"Bearer {TOKEN}"})
+              with urllib.request.urlopen(req) as resp:
+                  data = resp.read()
+                  encoding = (resp.headers.get("Content-Encoding") or "").lower()
+              if encoding == "gzip":
+                  data = gzip.decompress(data)
+              Path("prep-workspace.tar.gz").write_bytes(data)
+              downloaded = True
+              break
+          if not downloaded:
+              raise SystemExit(f"no artifact files: {files}")
+          PY
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          if [ -d .ci/bin ]; then
+            if [ -w /usr/local/bin ]; then
+              cp -a .ci/bin/. /usr/local/bin/
+            fi
+            if [ -n "${GITHUB_PATH:-}" ]; then
+              echo "$PWD/.ci/bin" >> "$GITHUB_PATH"
+            fi
+          fi
       - run: uv run ruff check .

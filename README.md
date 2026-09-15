@@ -27,7 +27,7 @@ uv run pre-commit install
 
 `git commit` then runs all five checks. Emergency skip: `SKIP=tests,sast,audit,gitleaks,style git commit`.
 
-The same five checks, also run as parallel Gitea Actions jobs:
+The same five checks run as parallel Gitea Actions jobs after a shared prep stage:
 
 ```bash
 uv run python manage.py test
