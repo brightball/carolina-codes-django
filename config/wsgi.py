@@ -7,7 +7,9 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 
 application = get_wsgi_application()
 
+# Registration uses a multi-second timeout. It runs after the application
+# object exists and does not block the worker from accepting connections.
 if "test" not in sys.argv and os.environ.get("DJANGO_SKIP_REGISTER") != "1":
-    from catalog.register import register_with_elixir
+    from catalog.register import schedule_registration
 
-    register_with_elixir()
+    schedule_registration()

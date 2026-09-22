@@ -2,7 +2,7 @@
 
 Read-only v1 polyglot API for Carolina Code Conference. **Django** + gunicorn. Distinct from `../python` (`http.server` on :4004).
 
-Queries PostgreSQL `v1_*` views via psycopg. Django’s `DATABASES` setting is in-memory sqlite so `migrate` cannot touch the catalog; `manage.py migrate` is refused. Registers with Elixir once on WSGI boot.
+Queries PostgreSQL `v1_*` views via psycopg. Django’s `DATABASES` setting is in-memory sqlite so `migrate` cannot touch the catalog; `manage.py migrate` is refused. The process registers with Elixir once in the background and answers `GET /health` without waiting on that call.
 
 ```bash
 uv sync

@@ -2,12 +2,18 @@ import gzip
 import json
 import os
 import re
+import signal
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
 import textwrap
 import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
@@ -97,6 +103,7 @@ class PolyglotApiTests(SimpleTestCase):
         self.assertEqual(body["language"], "Python")
         self.assertEqual(body["framework"], "Django")
         self.assertEqual(db.SQL_COUNT, 0)
+        self.assertEqual(db.CONNECT_COUNT, 0)
 
     def test_unknown_speaker_slug_404(self):
         self._ensure_catalog()
@@ -161,49 +168,356 @@ class PolyglotApiTests(SimpleTestCase):
         self.assertEqual(sponsors["r"].status_code, 200)
         self.assertIn("tier", sponsors["r"].json()["data"][0])
 
+    def test_advertised_routes_return_catalog_json(self):
+        self._ensure_catalog()
+        db.reset_counts()
+
+        root = self.client.get("/")
+        self.assertEqual(root.status_code, 200)
+        payload = root.json()
+        self.assertEqual(payload["language"], "Python")
+        self.assertEqual(payload["framework"], "Django")
+        self.assertEqual(db.SQL_COUNT, 0)
+        self.assertEqual(db.CONNECT_COUNT, 0)
+
+        db.reset_counts()
+        health = self.client.get("/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["status"], "ok")
+        self.assertEqual(db.SQL_COUNT, 0)
+        self.assertEqual(db.CONNECT_COUNT, 0)
+
+        speakers = self.client.get("/v1/speakers")
+        sponsors = self.client.get("/v1/sponsors")
+        years = self.client.get("/v1/years")
+        self.assertEqual(speakers.status_code, 200, speakers.content)
+        self.assertEqual(sponsors.status_code, 200, sponsors.content)
+        self.assertEqual(years.status_code, 200, years.content)
+        speaker_rows = speakers.json()["data"]
+        sponsor_rows = sponsors.json()["data"]
+        year_rows = years.json()["data"]
+        self.assertIsInstance(speaker_rows, list)
+        self.assertIsInstance(sponsor_rows, list)
+        self.assertIsInstance(year_rows, list)
+        self.assertTrue(speaker_rows)
+        self.assertTrue(sponsor_rows)
+        self.assertTrue(year_rows)
+
+        year = int(year_rows[0]["year"])
+        year_speakers = self.client.get("/v1/speakers", {"year": str(year)})
+        year_sponsors = self.client.get("/v1/sponsors", {"year": str(year)})
+        self.assertEqual(year_speakers.status_code, 200, year_speakers.content)
+        self.assertEqual(year_sponsors.status_code, 200, year_sponsors.content)
+        year_speaker_rows = year_speakers.json()["data"]
+        year_sponsor_rows = year_sponsors.json()["data"]
+        self.assertIsInstance(year_speaker_rows, list)
+        self.assertIsInstance(year_sponsor_rows, list)
+        self.assertTrue(year_speaker_rows)
+        self.assertTrue(year_sponsor_rows)
+
+        speaker_slug = speaker_rows[0]["slug"]
+        sponsor_slug = sponsor_rows[0]["slug"]
+        year_speaker_slug = year_speaker_rows[0]["slug"]
+        year_sponsor_slug = year_sponsor_rows[0]["slug"]
+        speaker_year = int(year_speaker_rows[0].get("year", year))
+        sponsor_year = int(year_sponsor_rows[0].get("year", year))
+        concrete = {
+            "/": "/",
+            "/health": "/health",
+            "/v1/years": "/v1/years",
+            "/v1/speakers": "/v1/speakers",
+            "/v1/speakers/:slug": f"/v1/speakers/{speaker_slug}",
+            "/v1/speakers/:year/:slug": f"/v1/speakers/{speaker_year}/{year_speaker_slug}",
+            "/v1/sponsors": "/v1/sponsors",
+            "/v1/sponsors/:slug": f"/v1/sponsors/{sponsor_slug}",
+            "/v1/sponsors/:year/:slug": f"/v1/sponsors/{sponsor_year}/{year_sponsor_slug}",
+        }
+
+        seen = set()
+        for endpoint in payload["endpoints"]:
+            self.assertEqual(endpoint["method"], "GET")
+            path = endpoint["path"]
+            self.assertIn(path, concrete, path)
+            self.assertNotIn(path, seen, path)
+            seen.add(path)
+            url = concrete[path]
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 200, url)
+            body = response.json()
+            if path == "/health":
+                self.assertEqual(body["status"], "ok")
+            elif path == "/":
+                self.assertEqual(body["language"], "Python")
+                self.assertEqual(body["framework"], "Django")
+            elif ":slug" in path:
+                self.assertIsInstance(body["data"], dict, url)
+                self.assertIn("slug", body["data"])
+            else:
+                self.assertIsInstance(body["data"], list, url)
+            query = endpoint.get("query") or []
+            if "year" in query:
+                listed = self.client.get(path, {"year": str(year)})
+                self.assertEqual(listed.status_code, 200, path)
+                self.assertIsInstance(listed.json()["data"], list)
+
+        self.assertEqual(seen, set(concrete))
+
+        for url in (
+            "/v1/speakers/no-such-speaker-slug",
+            "/v1/sponsors/no-such-sponsor-slug",
+            f"/v1/speakers/{speaker_year}/no-such-speaker-slug",
+            f"/v1/sponsors/{sponsor_year}/no-such-sponsor-slug",
+        ):
+            missing = self.client.get(url)
+            self.assertEqual(missing.status_code, 404, url)
+            self.assertEqual(missing.json(), {"error": "not_found"})
+
+        sql_before = db.SQL_COUNT
+        connect_before = db.CONNECT_COUNT
+        self.assertEqual(self.client.get("/").status_code, 200)
+        self.assertEqual(self.client.get("/health").status_code, 200)
+        self.assertEqual(db.SQL_COUNT, sql_before)
+        self.assertEqual(db.CONNECT_COUNT, connect_before)
+
     def _ensure_catalog(self):
         try:
             db.with_cursor(lambda cur: db.db_query(cur, "SELECT 1 AS ok"))
         except Exception:
+            speaker = {
+                "slug": "diana-pham",
+                "first_name": "Diana",
+                "last_name": "Pham",
+                "name": "Diana Pham",
+            }
+            talk = {
+                "slug": "talk",
+                "title": "Talk",
+                "speaker_slug": "diana-pham",
+                "year": 2026,
+                "languages": ["python"],
+                "topics": ["development"],
+            }
+            year_sponsor = {
+                "slug": "flywheel",
+                "name": "Flywheel",
+                "tier": "platinum",
+                "year": 2026,
+            }
+            sponsor = {
+                "slug": "flywheel",
+                "name": "Flywheel",
+                "website": "https://example.com",
+            }
 
             def fake(sql, args):
+                args = args or ()
+                if "FROM v1_years" in sql:
+                    return [{"year": 2026, "slug": "2026", "name": "2026", "status": "current"}]
                 if "FROM v1_speakers WHERE slug =" in sql:
+                    if args and args[0] == "diana-pham":
+                        return [speaker]
                     return []
                 if "FROM v1_speakers" in sql:
-                    return [
-                        {
-                            "slug": "diana-pham",
-                            "first_name": "Diana",
-                            "last_name": "Pham",
-                            "name": "Diana Pham",
-                        }
-                    ]
+                    return [speaker]
                 if "FROM v1_talks" in sql:
-                    return [
-                        {
-                            "slug": "talk",
-                            "title": "Talk",
-                            "speaker_slug": "diana-pham",
-                            "year": 2026,
-                            "languages": ["python"],
-                            "topics": ["development"],
-                        }
-                    ]
+                    if "speaker_slug = %s AND year = %s" in sql:
+                        if len(args) >= 2 and args[0] == "diana-pham" and int(args[1]) == 2026:
+                            return [talk]
+                        return []
+                    if "ANY" in sql:
+                        return [{"speaker_slug": "diana-pham", "year": 2026}]
+                    if "speaker_slug = %s" in sql:
+                        if args and args[0] == "diana-pham":
+                            return [talk]
+                        return []
+                    if "WHERE year = %s" in sql:
+                        if args and int(args[0]) == 2026:
+                            return [talk]
+                        return []
+                    return [talk]
                 if "FROM v1_year_sponsors" in sql:
-                    return [
-                        {
-                            "slug": "flywheel",
-                            "name": "Flywheel",
-                            "tier": "platinum",
-                            "year": 2026,
-                        }
-                    ]
+                    if "slug = %s" in sql:
+                        if len(args) >= 2 and int(args[0]) == 2026 and args[1] == "flywheel":
+                            return [year_sponsor]
+                        return []
+                    if "WHERE year = %s" in sql:
+                        if args and int(args[0]) == 2026:
+                            return [year_sponsor]
+                        return []
+                    return [year_sponsor]
+                # v1_sponsorships contains the substring v1_sponsors; match it first.
+                if "FROM v1_sponsorships" in sql:
+                    if not args or args[0] != "flywheel":
+                        return []
+                    if "DISTINCT year" in sql:
+                        return [{"year": 2026}]
+                    return [{"sponsor_slug": "flywheel", "year": 2026, "tier": "platinum"}]
                 if "FROM v1_sponsors WHERE slug" in sql:
+                    if args and args[0] == "flywheel":
+                        return [sponsor]
                     return []
+                if "FROM v1_sponsors" in sql:
+                    return [sponsor]
                 return []
 
             db.QUERY_FN = fake
             db.CONNECT_FN = lambda: (_ for _ in ()).throw(RuntimeError("fake connect"))
+
+
+class ColdStartConfigTests(SimpleTestCase):
+    def test_fly_keeps_one_machine_and_checks_health(self):
+        cfg = tomllib.loads((ROOT / "fly.toml").read_text())
+        http = cfg["http_service"]
+        minimum = http["min_machines_running"]
+        self.assertIsInstance(minimum, int)
+        self.assertGreaterEqual(minimum, 1)
+        self.assertIs(http["auto_start_machines"], True)
+        self.assertEqual(http["internal_port"], 8080)
+        self.assertEqual(cfg["env"]["PORT"], "8080")
+        checks = http["checks"]
+        self.assertTrue(any(item.get("method") == "GET" and item.get("path") == "/health" for item in checks))
+
+    def test_image_installs_locked_deps_without_local_venv(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("uv.lock", dockerfile)
+        self.assertIn("uv sync --frozen", dockerfile)
+        self.assertIn("gunicorn", dockerfile)
+        self.assertNotIn("migrate", dockerfile)
+        self.assertNotRegex(dockerfile, r"(?i)pip install[^\n]*(django|gunicorn|psycopg)")
+        for line in dockerfile.splitlines():
+            if not line.strip().startswith("COPY") or "--from=" in line:
+                continue
+            self.assertNotIn(".venv", line)
+            self.assertNotIn(".git", line)
+        ignore = (ROOT / ".dockerignore").read_text().splitlines()
+        self.assertIn(".venv", ignore)
+        self.assertIn(".git", ignore)
+        self.assertTrue(any("__pycache__" in line or line == ".ruff_cache" for line in ignore))
+
+    def test_health_is_served_while_registration_hangs(self):
+        peer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        peer.bind(("127.0.0.1", 0))
+        peer.listen(1)
+        peer_port = peer.getsockname()[1]
+        accepted = threading.Event()
+        stop = threading.Event()
+        times = {}
+
+        def stall():
+            try:
+                conn, _ = peer.accept()
+            except OSError:
+                return
+            times["accept"] = time.perf_counter()
+            accepted.set()
+            stop.wait(30)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+        stall_thread = threading.Thread(target=stall, daemon=True)
+        stall_thread.start()
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        app_port = probe.getsockname()[1]
+        probe.close()
+
+        env = os.environ.copy()
+        env.pop("DATABASE_URL", None)
+        env.pop("DJANGO_SKIP_REGISTER", None)
+        env["CAROLINA_URL"] = f"http://127.0.0.1:{peer_port}"
+        env["POLYGLOT_REGISTER_TOKEN"] = "dev"
+        env["PUBLIC_BASE_URL"] = f"http://127.0.0.1:{app_port}"
+        env["PORT"] = str(app_port)
+        env["DJANGO_SETTINGS_MODULE"] = "config.settings"
+        env["PYTHONUNBUFFERED"] = "1"
+
+        log = tempfile.TemporaryFile(mode="w+")
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "gunicorn",
+                "--bind",
+                f"127.0.0.1:{app_port}",
+                "--workers",
+                "1",
+                "--threads",
+                "2",
+                "--timeout",
+                "30",
+                "config.wsgi:application",
+            ],
+            cwd=ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        def logs():
+            log.seek(0)
+            return log.read()
+
+        try:
+            deadline = time.perf_counter() + 15
+            status = None
+            raw = b""
+            while time.perf_counter() < deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{app_port}/health", timeout=0.5) as resp:
+                        status = resp.status
+                        raw = resp.read()
+                        times["health"] = time.perf_counter()
+                        break
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    time.sleep(0.05)
+            self.assertIsNotNone(times.get("health"), f"gunicorn did not serve /health\n{logs()}")
+            self.assertEqual(status, 200, logs())
+            self.assertEqual(json.loads(raw.decode())["status"], "ok")
+            self.assertTrue(accepted.wait(5), f"registration never connected\n{logs()}")
+            self.assertLess(times["health"] - times["accept"], 2.0, logs())
+
+            started = time.perf_counter()
+            with urllib.request.urlopen(f"http://127.0.0.1:{app_port}/health", timeout=2) as resp:
+                health = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 200)
+            self.assertLess(time.perf_counter() - started, 2.0)
+            self.assertEqual(health["status"], "ok")
+
+            started = time.perf_counter()
+            with urllib.request.urlopen(f"http://127.0.0.1:{app_port}/", timeout=2) as resp:
+                identity = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 200)
+            self.assertLess(time.perf_counter() - started, 2.0)
+            self.assertEqual(identity["language"], "Python")
+            self.assertEqual(identity["framework"], "Django")
+        finally:
+            stop.set()
+            try:
+                peer.close()
+            except OSError:
+                pass
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait(timeout=5)
+            stall_thread.join(timeout=2)
+            log.close()
 
 
 CHECK_IDS = ("tests", "sast", "audit", "gitleaks", "style")

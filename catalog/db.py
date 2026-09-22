@@ -6,9 +6,6 @@ import os
 import sys
 import threading
 
-import psycopg
-from psycopg.rows import dict_row
-
 LANGUAGE = "Python"
 FRAMEWORK = "Django"
 API_VERSION = "0.2.0"
@@ -41,7 +38,9 @@ SPONSOR_COLS = (
 )
 TALK_COLS = "slug, title, description, format, youtube_id, year, speaker_slug, languages, topics"
 
-POOL_SIZE = int(os.environ.get("DJANGO_DB_POOL", "8"))
+# One gunicorn process on a 256mb machine. Two connections cover the two
+# request threads without opening a pile of Postgres sessions at first use.
+POOL_SIZE = int(os.environ.get("DJANGO_DB_POOL", "2"))
 SQL_COUNT = 0
 CONNECT_COUNT = 0
 CONNECT_FN = None
@@ -75,7 +74,11 @@ def open_connection():
         CONNECT_COUNT += 1
     if CONNECT_FN:
         return CONNECT_FN()
-    return psycopg.connect(dsn(), row_factory=dict_row, autocommit=True)
+    target = dsn()
+    import psycopg
+    from psycopg.rows import dict_row
+
+    return psycopg.connect(target, row_factory=dict_row, autocommit=True)
 
 
 def acquire():

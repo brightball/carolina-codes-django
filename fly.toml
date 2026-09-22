@@ -10,13 +10,16 @@ primary_region = "iad"
   PORT = "8080"
   CAROLINA_URL = "http://carolina-codes.internal:8080"
   PUBLIC_BASE_URL = "https://carolina-codes-django.fly.dev"
+  DJANGO_DB_POOL = "2"
 
 [http_service]
   internal_port = 8080
   force_https = true
   auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 0
+  # A zero minimum stops the last machine. The next request then pays a full
+  # cold boot. Keep one machine running in the primary region.
+  min_machines_running = 1
   processes = ["app"]
 
   [[http_service.checks]]

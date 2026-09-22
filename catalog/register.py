@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import urllib.request
 from urllib.parse import urlparse
 
 from catalog import db
+
+_register_lock = threading.Lock()
+_register_started = False
 
 
 def register_with_elixir(port: str | None = None) -> None:
@@ -37,3 +41,21 @@ def register_with_elixir(port: str | None = None) -> None:
             print(f"registered with elixir: {resp.status}", file=sys.stderr)
     except Exception as exc:
         print(f"register: {exc}", file=sys.stderr)
+
+
+def schedule_registration() -> None:
+    """Attempt CMS registration once per process, off the listen path.
+
+    The caller returns as soon as the background attempt is started. A slow
+    or unreachable CMS must not delay the first request.
+    """
+    global _register_started
+    with _register_lock:
+        if _register_started:
+            return
+        _register_started = True
+        threading.Thread(
+            target=register_with_elixir,
+            name="elixir-register",
+            daemon=True,
+        ).start()
