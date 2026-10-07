@@ -791,3 +791,226 @@ class QualityGatesTests(SimpleTestCase):
         self.assertIn("pre-commit", pyproject)
         mise = (ROOT / "mise.toml").read_text()
         self.assertIn("gitleaks", mise)
+
+
+def _load_toml(name: str) -> dict:
+    return tomllib.loads((ROOT / name).read_text())
+
+
+def _dep_name(spec: str) -> str:
+    return re.split(r"[\[<>=!~\s]", spec, maxsplit=1)[0]
+
+
+def _lock_packages() -> list:
+    return _load_toml("uv.lock")["package"]
+
+
+def _lock_root_dependencies() -> list:
+    for package in _lock_packages():
+        if package["name"] == "carolina-codes-django":
+            return package["dependencies"]
+    raise AssertionError("uv.lock is missing carolina-codes-django")
+
+
+def _locked_version(package_name: str) -> str:
+    versions = [pkg["version"] for pkg in _lock_packages() if pkg["name"] == package_name and "version" in pkg]
+    if len(versions) != 1:
+        raise AssertionError(f"{package_name} versions: {versions}")
+    return versions[0]
+
+
+def _django_lock_phrases() -> list[str]:
+    phrases = []
+    for dep in _lock_root_dependencies():
+        if dep["name"] != "django":
+            continue
+        version = dep["version"]
+        py = re.search(r"(\d+\.\d+)", dep["marker"]).group(1)
+        if re.search(r"<\s*'", dep["marker"]):
+            phrases.append(f"Django {version} when Python is below {py}")
+        elif re.search(r">=\s*'", dep["marker"]):
+            phrases.append(f"Django {version} when Python is {py} or newer")
+        else:
+            raise AssertionError(dep["marker"])
+    if len(phrases) < 2:
+        raise AssertionError(phrases)
+    return phrases
+
+
+def _python_image_tags(text: str) -> set[str]:
+    return set(re.findall(r"python:\d+\.\d+(?:-[A-Za-z0-9.]+)?", text))
+
+
+ALLOWED_VIEWS = {
+    "v1_speakers",
+    "v1_sponsors",
+    "v1_years",
+    "v1_talks",
+    "v1_sponsorships",
+    "v1_year_speakers",
+    "v1_year_sponsors",
+}
+STARTER_ONLY_PATHS = ("openapi.yaml", "db/*.sql", "docker-compose.yml", "src/")
+DOC_FILES = ("AGENTS.md", "README.md", "MEMORY.md", "DECISIONS.md")
+PRIVATE_MARKERS = ("ts.net", "SECRET_KEY", "zebra-hydra", "carolina-codes.internal")
+
+
+class AgentDocsContractTests(SimpleTestCase):
+    def test_readme_and_memory_quote_lockfile_versions(self):
+        readme = (ROOT / "README.md").read_text()
+        memory = (ROOT / "MEMORY.md").read_text()
+        project = _load_toml("pyproject.toml")["project"]
+        mise = _load_toml("mise.toml")["tools"]
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        workflow = (ROOT / ".gitea" / "workflows" / "precommit.yml").read_text()
+
+        self.assertIn(project["requires-python"], readme)
+        self.assertIn(project["requires-python"], memory)
+        for spec in project["dependencies"]:
+            self.assertIn(spec, readme)
+            self.assertIn(spec, memory)
+            self.assertIn(_dep_name(spec), readme)
+        for spec in _load_toml("pyproject.toml")["dependency-groups"]["dev"]:
+            self.assertIn(_dep_name(spec), readme)
+            self.assertIn(_dep_name(spec), memory)
+
+        for phrase in _django_lock_phrases():
+            self.assertIn(phrase, readme)
+            self.assertIn(phrase, memory)
+
+        for package_name in ("gunicorn", "psycopg"):
+            version = _locked_version(package_name)
+            self.assertIn(version, readme)
+            self.assertIn(version, memory)
+        psycopg = next(dep for dep in _lock_root_dependencies() if dep["name"] == "psycopg")
+        self.assertIn("binary", psycopg.get("extra", []))
+        self.assertIn("binary", readme)
+        self.assertIn("binary", memory)
+
+        uv_image = re.search(r"uv:(\d+\.\d+\.\d+)", dockerfile)
+        self.assertIsNotNone(uv_image)
+        self.assertEqual(uv_image.group(1), mise["uv"])
+        self.assertIn(mise["uv"], readme)
+        self.assertIn(mise["uv"], memory)
+        self.assertIn("uv", readme)
+        self.assertIn(mise["gitleaks"], readme)
+        self.assertIn(mise["gitleaks"], memory)
+        self.assertIn(mise["gitleaks"], GITLEAKS_TARBALL)
+
+        image_tags = _python_image_tags(dockerfile) | _python_image_tags(workflow)
+        self.assertGreaterEqual(len(image_tags), 2)
+        for tag in image_tags:
+            self.assertIn(tag, readme)
+            self.assertIn(tag, memory)
+        self.assertIn("Gitea", readme)
+        for name in DOC_FILES:
+            self.assertNotIn("crac", (ROOT / name).read_text().lower(), name)
+
+        start = readme.split("```bash", 1)[1].split("```", 1)[0]
+        self.assertIn("gunicorn", start)
+        self.assertNotIn("migrate", start)
+
+    def test_agents_memory_and_decisions_keep_their_roles(self):
+        agents = (ROOT / "AGENTS.md").read_text()
+        memory = (ROOT / "MEMORY.md").read_text()
+        decisions = (ROOT / "DECISIONS.md").read_text()
+        code = (ROOT / "catalog" / "db.py").read_text() + (ROOT / "catalog" / "views.py").read_text()
+        code_views = set(re.findall(r"v1_[a-z_]+", code))
+        self.assertTrue(code_views <= ALLOWED_VIEWS, code_views - ALLOWED_VIEWS)
+        self.assertTrue(ALLOWED_VIEWS <= set(re.findall(r"v1_[a-z_]+", agents)))
+
+        for snippet in (
+            "/health",
+            "GET /",
+            "/v1/years",
+            "/v1/speakers",
+            "/v1/sponsors",
+            "?year=",
+            "/{year}/{slug}",
+            '{ "data": [ ... ] }',
+            "404",
+            "heartbeat",
+            "CAROLINA_URL",
+            "DATABASE_URL",
+            "POLYGLOT_REGISTER_TOKEN",
+            "PUBLIC_BASE_URL",
+            "PORT",
+            "Ash",
+            "JSON:API",
+            "psycopg",
+            "sqlite",
+            ":memory:",
+            "makemigrations",
+            "migrate",
+            "background",
+            "uv",
+            "MEMORY.md",
+            "DECISIONS.md",
+            "workspace root",
+            "Phoenix",
+        ):
+            self.assertIn(snippet, agents, snippet)
+
+        self.assertIn("Update `DECISIONS.md` when a durable choice changes.", agents)
+        self.assertIn("Update `MEMORY.md` when a fact or command changes.", agents)
+        self.assertIn("Do not store secrets", agents)
+        self.assertIn("GET /health", agents)
+        self.assertIn("does not wait", agents)
+
+        register = (ROOT / "catalog" / "register.py").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        local_port = re.search(r'os\.environ\.get\("PORT", "(\d+)"\)', register).group(1)
+        container_port = re.search(r"^EXPOSE (\d+)\s*$", dockerfile, re.M).group(1)
+        self.assertIn(local_port, agents)
+        self.assertIn(container_port, agents)
+        self.assertIn(local_port, memory)
+        self.assertIn(container_port, memory)
+        self.assertNotEqual(local_port, container_port)
+
+        for starter_path in STARTER_ONLY_PATHS:
+            hits = [line for line in agents.splitlines() if starter_path in line]
+            self.assertTrue(hits, starter_path)
+            for line in hits:
+                lowered = line.lower()
+                self.assertTrue("do not" in lowered or "not in this repo" in lowered, line)
+
+        pool = re.search(r'DJANGO_DB_POOL", "(\d+)"', (ROOT / "catalog" / "db.py").read_text()).group(1)
+        docker_pool = re.search(r"DJANGO_DB_POOL=(\d+)", dockerfile).group(1)
+        self.assertEqual(docker_pool, pool)
+        vm_memory = _load_toml("fly.toml")["vm"][0]["memory"]
+        self.assertIn(f"DJANGO_DB_POOL` defaults to {pool}", memory)
+        self.assertIn(f"Fly VM is {vm_memory}", memory)
+        for command in CHECK_COMMANDS.values():
+            self.assertIn(command, memory)
+        self.assertIn("gunicorn", memory)
+        self.assertIn("secret", memory.lower())
+        self.assertNotIn("Rejected:", memory)
+        self.assertIsNone(re.search(r"^## \d+\. ", memory, re.M))
+
+        blocks = [block for block in re.split(r"(?=^## \d+\. )", decisions, flags=re.M) if block.startswith("## ")]
+        self.assertGreaterEqual(len(blocks), 3)
+        combined = decisions.lower()
+        self.assertIn("orm", combined)
+        self.assertIn("migration", combined)
+        self.assertIn("v1_", decisions)
+        self.assertTrue("request path" in combined or "background" in combined)
+        self.assertIn("background", combined)
+        for name in ("tests", "bandit", "pip-audit", "gitleaks", "ruff"):
+            self.assertIn(name, combined)
+        self.assertTrue("combined" in combined or "pre-commit run --all-files" in decisions)
+        for block in blocks:
+            self.assertIn("Status:", block)
+            self.assertIn("accepted", block.lower())
+            self.assertRegex(block, r"Date: \d{4}-\d{2}-\d{2}")
+            self.assertIn("Choice:", block)
+            self.assertIn("Rejected:", block)
+
+    def test_agent_docs_have_no_private_markers(self):
+        text = "\n".join((ROOT / name).read_text() for name in DOC_FILES)
+        for marker in PRIVATE_MARKERS:
+            self.assertNotIn(marker, text)
+        for match in re.finditer(r"(?i)bearer\s+(\S+)", text):
+            self.assertEqual(match.group(1).strip("`'\".,)"), "dev")
+        for match in re.finditer(r"postgres(?:ql)?://([^:@/\s]+):([^@/\s]+)@", text):
+            self.assertEqual(match.group(1), "postgres")
+            self.assertEqual(match.group(2), "postgres")

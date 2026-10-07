@@ -16,6 +16,14 @@ uv run gunicorn --bind "[::]:4019" config.wsgi:application
 
 `GET /` reports `language: "Python"` and `framework: "Django"`. `GET /health` returns `{"status":"ok"}` without touching Postgres.
 
+## Versions
+
+`requires-python` is `>=3.11`. The container image is `python:3.12-slim`. Gitea CI uses `python:3.12-bookworm`.
+
+Declared dependencies are `django>=5.2`, `gunicorn>=23.0`, and `psycopg[binary]>=3.2`. uv.lock selects Django 5.2.17 when Python is below 3.12 and Django 6.1.1 when Python is 3.12 or newer. The image and CI run Python 3.12, so they install Django 6.1.1.
+
+The lockfile pins gunicorn 26.2.0 and psycopg 3.3.5 with the binary extra. Tools on this repo are uv 0.11.21, ruff, bandit, pip-audit, pre-commit, and gitleaks 8.30.1.
+
 ## Quality checks
 
 Install git hooks once (`gitleaks` must be on PATH; `mise.toml` pins it):
