@@ -370,7 +370,8 @@ class ColdStartConfigTests(SimpleTestCase):
         http = cfg["http_service"]
         minimum = http["min_machines_running"]
         self.assertIsInstance(minimum, int)
-        self.assertGreaterEqual(minimum, 1)
+        self.assertEqual(minimum, 0)
+        self.assertEqual(http["auto_stop_machines"], "stop")
         self.assertIs(http["auto_start_machines"], True)
         self.assertEqual(http["internal_port"], 8080)
         self.assertEqual(cfg["env"]["PORT"], "8080")
